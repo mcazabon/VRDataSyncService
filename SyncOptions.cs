@@ -8,6 +8,8 @@ public sealed class SyncOptions
 
     public int BatchSize { get; set; } = 10000;
 
+    public long? MaxSection2RowsToTransfer { get; set; }
+
     public string SourceConnectionString { get; set; } = string.Empty;
 
     public string DestinationConnectionString { get; set; } = string.Empty;

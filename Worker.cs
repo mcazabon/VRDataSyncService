@@ -42,6 +42,7 @@ CREATE TABLE dbo.SyncProgress
 
             var batchSize = Math.Max(1, _options.BatchSize);
             var syncName = _options.SyncName.Trim();
+            var maxSection2RowsToTransfer = _options.MaxSection2RowsToTransfer;
 
             await using var sourceConnection = new SqlConnection(_options.SourceConnectionString);
             await using var destinationConnection = new SqlConnection(_options.DestinationConnectionString);
@@ -51,10 +52,19 @@ CREATE TABLE dbo.SyncProgress
 
             await EnsureProgressTableAsync(destinationConnection, stoppingToken);
 
-            await SyncSection2Async(sourceConnection, destinationConnection, syncName, batchSize, stoppingToken);
-            await SyncSectionMeta2Async(sourceConnection, destinationConnection, syncName, batchSize, stoppingToken);
-            await SyncSectionCentera2Async(sourceConnection, destinationConnection, syncName, batchSize, stoppingToken);
-            await SyncSectionCdrMedia2Async(sourceConnection, destinationConnection, syncName, batchSize, stoppingToken);
+            var maxSection2CcdrId = await GetMaxSection2CcdrIdAsync(sourceConnection, maxSection2RowsToTransfer, stoppingToken);
+            if (!string.IsNullOrWhiteSpace(maxSection2CcdrId))
+            {
+                _logger.LogInformation(
+                    "Testing limit enabled: syncing up to {MaxSection2RowsToTransfer} section2 rows ending at CCDR_ID {MaxSection2CcdrId}.",
+                    maxSection2RowsToTransfer,
+                    maxSection2CcdrId);
+            }
+
+            await SyncSection2Async(sourceConnection, destinationConnection, syncName, batchSize, maxSection2CcdrId, stoppingToken);
+            await SyncSectionMeta2Async(sourceConnection, destinationConnection, syncName, batchSize, maxSection2CcdrId, stoppingToken);
+            await SyncSectionCentera2Async(sourceConnection, destinationConnection, syncName, batchSize, maxSection2CcdrId, stoppingToken);
+            await SyncSectionCdrMedia2Async(sourceConnection, destinationConnection, syncName, batchSize, maxSection2CcdrId, stoppingToken);
 
             _logger.LogInformation("Sync completed for {SyncName}.", syncName);
         }
@@ -74,6 +84,7 @@ CREATE TABLE dbo.SyncProgress
         SqlConnection destination,
         string syncName,
         int batchSize,
+        string? maxSection2CcdrId,
         CancellationToken cancellationToken)
     {
         const string tableName = "dbo.section2";
@@ -93,9 +104,9 @@ CREATE TABLE dbo.SyncProgress
             syncName,
             tableName,
             cancellationToken,
-            fetchSourceTotalRowsAsync: ct => CountRowsAsync(source, tableName, ct),
-            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, ct),
-            fetchRowsAsync: (lastCcdrId, maxCcdrId, ct) => ReadSection2RowsAsync(source, commonColumns, lastCcdrId, batchSize, ct),
+            fetchSourceTotalRowsAsync: ct => CountRowsByCcdrIdRangeAsync(source, tableName, keyColumn, maxSection2CcdrId, ct),
+            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, maxSection2CcdrId, ct),
+            fetchRowsAsync: (lastCcdrId, maxCcdrId, ct) => ReadSection2RowsAsync(source, commonColumns, lastCcdrId, batchSize, maxSection2CcdrId, ct),
             writeBatchAsync: (rows, tx, ct) => MergeBatchAsync(destination, tx, tableName, commonColumns, new[] { keyColumn }, rows, ct));
     }
 
@@ -104,6 +115,7 @@ CREATE TABLE dbo.SyncProgress
         SqlConnection destination,
         string syncName,
         int batchSize,
+        string? maxSection2CcdrId,
         CancellationToken cancellationToken)
     {
         const string tableName = "dbo.section_meta2";
@@ -127,8 +139,8 @@ CREATE TABLE dbo.SyncProgress
             syncName,
             tableName,
             cancellationToken,
-            fetchSourceTotalRowsAsync: ct => CountRowsAsync(source, tableName, ct),
-            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, ct),
+            fetchSourceTotalRowsAsync: ct => CountRowsByCcdrIdRangeAsync(source, tableName, "ccdr_id", maxSection2CcdrId, ct),
+            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, maxSection2CcdrId, ct),
             fetchRowsAsync: (lastCcdrId, maxCcdrId, ct) => ReadTableRangeAsync(source, tableName, commonColumns, "ccdr_id", lastCcdrId, maxCcdrId, ct),
             writeBatchAsync: (rows, tx, ct) => MergeBatchAsync(destination, tx, tableName, commonColumns, mergeKeys, rows, ct));
     }
@@ -138,6 +150,7 @@ CREATE TABLE dbo.SyncProgress
         SqlConnection destination,
         string syncName,
         int batchSize,
+        string? maxSection2CcdrId,
         CancellationToken cancellationToken)
     {
         const string tableName = "dbo.section_centera2";
@@ -155,8 +168,8 @@ CREATE TABLE dbo.SyncProgress
             syncName,
             tableName,
             cancellationToken,
-            fetchSourceTotalRowsAsync: ct => CountRowsAsync(source, tableName, ct),
-            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, ct),
+            fetchSourceTotalRowsAsync: ct => CountRowsByCcdrIdRangeAsync(source, tableName, "ccdr_id", maxSection2CcdrId, ct),
+            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, maxSection2CcdrId, ct),
             fetchRowsAsync: (lastCcdrId, maxCcdrId, ct) => ReadSectionCenteraRowsAsync(source, lastCcdrId, maxCcdrId, ct),
             writeBatchAsync: (rows, tx, ct) => InsertIfNotExistsAsync(
                 destination,
@@ -173,6 +186,7 @@ CREATE TABLE dbo.SyncProgress
         SqlConnection destination,
         string syncName,
         int batchSize,
+        string? maxSection2CcdrId,
         CancellationToken cancellationToken)
     {
         const string tableName = "dbo.section_cdr_media2";
@@ -197,8 +211,8 @@ CREATE TABLE dbo.SyncProgress
             syncName,
             tableName,
             cancellationToken,
-            fetchSourceTotalRowsAsync: ct => CountRowsAsync(source, tableName, ct),
-            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, ct),
+            fetchSourceTotalRowsAsync: ct => CountRowsByCcdrIdRangeAsync(source, tableName, "ccdr_id", maxSection2CcdrId, ct),
+            fetchBoundaryAsync: (lastCcdrId, ct) => GetParentBoundaryAsync(source, lastCcdrId, batchSize, maxSection2CcdrId, ct),
             fetchRowsAsync: (lastCcdrId, maxCcdrId, ct) => ReadSectionCdrMediaRowsAsync(source, commonColumns, lastCcdrId, maxCcdrId, ct),
             writeBatchAsync: (rows, tx, ct) => mergeKeys.Count > 0
                 ? MergeBatchAsync(destination, tx, tableName, commonColumns, mergeKeys, rows, ct)
@@ -324,6 +338,7 @@ END
         SqlConnection source,
         string? lastCcdrId,
         int batchSize,
+        string? maxSection2CcdrId,
         CancellationToken cancellationToken)
     {
         const string sql = """
@@ -335,6 +350,7 @@ FROM
     SELECT TOP (@batchSize) s.CCDR_ID
     FROM dbo.section2 AS s
     WHERE (@lastCcdrId IS NULL OR s.CCDR_ID > @lastCcdrId)
+      AND (@maxSection2CcdrId IS NULL OR s.CCDR_ID <= @maxSection2CcdrId)
     ORDER BY s.CCDR_ID
 ) AS batch;
 """;
@@ -342,6 +358,7 @@ FROM
         await using var command = new SqlCommand(sql, source);
         command.Parameters.AddWithValue("@batchSize", batchSize);
         command.Parameters.AddWithValue("@lastCcdrId", (object?)lastCcdrId ?? DBNull.Value);
+        command.Parameters.AddWithValue("@maxSection2CcdrId", (object?)maxSection2CcdrId ?? DBNull.Value);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
@@ -362,6 +379,7 @@ FROM
         IReadOnlyList<string> columns,
         string? lastCcdrId,
         int batchSize,
+        string? maxSection2CcdrId,
         CancellationToken cancellationToken)
     {
         var selectColumns = BuildColumnList(columns);
@@ -369,12 +387,14 @@ FROM
 SELECT TOP (@batchSize) {selectColumns}
 FROM dbo.section2 AS s
 WHERE (@lastCcdrId IS NULL OR s.CCDR_ID > @lastCcdrId)
+  AND (@maxSection2CcdrId IS NULL OR s.CCDR_ID <= @maxSection2CcdrId)
 ORDER BY s.CCDR_ID;
 """;
 
         await using var command = new SqlCommand(sql, source);
         command.Parameters.AddWithValue("@batchSize", batchSize);
         command.Parameters.AddWithValue("@lastCcdrId", (object?)lastCcdrId ?? DBNull.Value);
+        command.Parameters.AddWithValue("@maxSection2CcdrId", (object?)maxSection2CcdrId ?? DBNull.Value);
 
         return await ReadDataTableAsync(command, cancellationToken);
     }
@@ -658,12 +678,49 @@ WHERE sync_name = @syncName
         return value == DBNull.Value || value is null ? null : Convert.ToString(value);
     }
 
-    private static async Task<long> CountRowsAsync(
+    private static async Task<string?> GetMaxSection2CcdrIdAsync(
         SqlConnection source,
-        string tableName,
+        long? maxSection2RowsToTransfer,
         CancellationToken cancellationToken)
     {
-        await using var command = new SqlCommand($"SELECT COUNT_BIG(1) FROM {tableName};", source);
+        if (maxSection2RowsToTransfer is null)
+        {
+            return null;
+        }
+
+        const string sql = """
+SELECT MAX(batch.CCDR_ID)
+FROM
+(
+    SELECT TOP (@maxSection2RowsToTransfer) s.CCDR_ID
+    FROM dbo.section2 AS s
+    ORDER BY s.CCDR_ID
+) AS batch;
+""";
+
+        await using var command = new SqlCommand(sql, source);
+        command.Parameters.AddWithValue("@maxSection2RowsToTransfer", maxSection2RowsToTransfer.Value);
+
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return value == DBNull.Value || value is null ? null : Convert.ToString(value);
+    }
+
+    private static async Task<long> CountRowsByCcdrIdRangeAsync(
+        SqlConnection source,
+        string tableName,
+        string ccdrColumn,
+        string? maxSection2CcdrId,
+        CancellationToken cancellationToken)
+    {
+        var sql = $"""
+SELECT COUNT_BIG(1)
+FROM {tableName}
+WHERE (@maxSection2CcdrId IS NULL OR {QuoteIdentifier(ccdrColumn)} <= @maxSection2CcdrId);
+""";
+
+        await using var command = new SqlCommand(sql, source);
+        command.Parameters.AddWithValue("@maxSection2CcdrId", (object?)maxSection2CcdrId ?? DBNull.Value);
+
         var value = await command.ExecuteScalarAsync(cancellationToken);
         return value is null || value == DBNull.Value ? 0L : Convert.ToInt64(value);
     }
@@ -767,6 +824,11 @@ ORDER BY c.column_id;
         if (string.IsNullOrWhiteSpace(options.SyncName))
         {
             throw new InvalidOperationException("Sync:SyncName is required.");
+        }
+
+        if (options.MaxSection2RowsToTransfer is <= 0)
+        {
+            throw new InvalidOperationException("Sync:MaxSection2RowsToTransfer must be greater than zero when specified.");
         }
     }
 }
