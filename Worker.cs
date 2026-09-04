@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
 using Microsoft.Data.SqlClient;
@@ -11,9 +12,10 @@ public sealed class Worker : BackgroundService
     [
         -2,
         53,
-        1205,
         233,
         701,
+        1205,
+        10054,
         10928,
         10929,
         40197,
@@ -184,6 +186,7 @@ CREATE TABLE dbo.SyncProgress
         }
         catch (Exception ex)
         {
+            LogConnectionFailureContext(ex);
             _logger.LogError(ex, "Synchronization failed.");
             throw;
         }
@@ -1527,6 +1530,11 @@ ORDER BY c.column_id;
             return true;
         }
 
+        if (IsPreLoginHandshakeOrConnectionResetFailure(exception))
+        {
+            return true;
+        }
+
         if (exception is SqlException sqlException)
         {
             return sqlException.Errors.Cast<SqlError>().Any(error => TransientSqlErrorNumbers.Contains(error.Number));
@@ -1536,6 +1544,61 @@ ORDER BY c.column_id;
         {
             return invalidOperationException.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
                 || invalidOperationException.Message.Contains("transient", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
+    }
+
+    private void LogConnectionFailureContext(Exception exception)
+    {
+        if (!IsPreLoginHandshakeOrConnectionResetFailure(exception))
+        {
+            return;
+        }
+
+        _logger.LogError(
+            "Detected SQL pre-login handshake/connection-reset failure. This usually indicates intermittent network path interruption, TLS/protocol negotiation mismatch, or SQL Server endpoint pressure.");
+
+        LogConnectionEndpoint("Source", _options.SourceConnectionString);
+        LogConnectionEndpoint("Destination", _options.DestinationConnectionString);
+    }
+
+    private void LogConnectionEndpoint(string role, string connectionString)
+    {
+        var builder = new SqlConnectionStringBuilder(connectionString);
+
+        _logger.LogError(
+            "{Role} endpoint details -> Server={Server}, Database={Database}, Encrypt={Encrypt}, TrustServerCertificate={TrustServerCertificate}, ConnectTimeout={ConnectTimeout}s.",
+            role,
+            builder.DataSource,
+            builder.InitialCatalog,
+            builder.Encrypt,
+            builder.TrustServerCertificate,
+            builder.ConnectTimeout);
+    }
+
+    private static bool IsPreLoginHandshakeOrConnectionResetFailure(Exception exception)
+    {
+        if (exception is SqlException sqlException)
+        {
+            var hasPreLoginMessage = sqlException.Message.Contains("pre-login handshake", StringComparison.OrdinalIgnoreCase);
+            var hasTransientSqlError = sqlException.Errors.Cast<SqlError>().Any(error => TransientSqlErrorNumbers.Contains(error.Number));
+            var hasConnectionReset = ContainsWin32ErrorCode(sqlException, 10054);
+
+            return hasPreLoginMessage || hasTransientSqlError || hasConnectionReset;
+        }
+
+        return exception.InnerException is not null && IsPreLoginHandshakeOrConnectionResetFailure(exception.InnerException);
+    }
+
+    private static bool ContainsWin32ErrorCode(Exception exception, int errorCode)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is Win32Exception win32 && win32.NativeErrorCode == errorCode)
+            {
+                return true;
+            }
         }
 
         return false;
