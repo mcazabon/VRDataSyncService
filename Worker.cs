@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
+using System.Globalization;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 
@@ -81,10 +82,61 @@ CREATE TABLE dbo.SyncProgress
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        ValidateOptions(_options);
+
+        var syncName = _options.SyncName.Trim();
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var restartDelay = await GetSyncRestartDelayAsync(syncName, stoppingToken);
+                if (restartDelay > TimeSpan.Zero)
+                {
+                    _logger.LogWarning(
+                        "Previous sync attempt for {SyncName} is incomplete. Waiting {RestartDelay} before retrying.",
+                        syncName,
+                        FormatDuration(restartDelay));
+
+                    await Task.Delay(restartDelay, stoppingToken);
+                }
+
+                await RunSyncOnceAsync(stoppingToken);
+                break;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception)
+            {
+                if (await IsSyncFullyCompletedAsync(syncName, stoppingToken))
+                {
+                    break;
+                }
+
+                var delay = await GetSyncRestartDelayAsync(syncName, stoppingToken);
+                if (delay <= TimeSpan.Zero)
+                {
+                    delay = TimeSpan.FromMinutes(10);
+                }
+
+                _logger.LogWarning(
+                    "Sync {SyncName} is not fully completed. Waiting {RestartDelay} before retrying the sync process.",
+                    syncName,
+                    FormatDuration(delay));
+
+                await Task.Delay(delay, stoppingToken);
+            }
+        }
+
+        _lifetime.StopApplication();
+    }
+
+    private async Task RunSyncOnceAsync(CancellationToken stoppingToken)
+    {
         try
         {
-            ValidateOptions(_options);
-
             var batchSize = Math.Max(1, _options.BatchSize);
             var syncName = _options.SyncName.Trim();
             var testModeEnabled = _options.TestMode.Enabled;
@@ -189,10 +241,6 @@ CREATE TABLE dbo.SyncProgress
             LogConnectionFailureContext(ex);
             _logger.LogError(ex, "Synchronization failed.");
             throw;
-        }
-        finally
-        {
-            _lifetime.StopApplication();
         }
     }
 
@@ -1310,6 +1358,57 @@ WHEN NOT MATCHED THEN
             token => fetchSourceTotalRowsAsync(token),
             $"Count source rows for {tableName}",
             cancellationToken);
+    }
+
+    private async Task<TimeSpan> GetSyncRestartDelayAsync(string syncName, CancellationToken cancellationToken)
+    {
+        if (await IsSyncFullyCompletedAsync(syncName, cancellationToken))
+        {
+            return TimeSpan.Zero;
+        }
+
+        const string sql = """
+SELECT MAX(updated_at)
+FROM dbo.SyncProgress
+WHERE sync_name = @syncName
+  AND status <> 'completed';
+""";
+
+        await using var connection = new SqlConnection(_options.DestinationConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = CreateCommand(sql, connection);
+        command.Parameters.AddWithValue("@syncName", syncName);
+
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        if (value is null || value == DBNull.Value)
+        {
+            return TimeSpan.Zero;
+        }
+
+        var lastHeartbeatUtc = DateTime.SpecifyKind(Convert.ToDateTime(value, CultureInfo.InvariantCulture), DateTimeKind.Utc);
+        var elapsed = DateTime.UtcNow - lastHeartbeatUtc;
+        var remaining = TimeSpan.FromMinutes(10) - elapsed;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+    }
+
+    private async Task<bool> IsSyncFullyCompletedAsync(string syncName, CancellationToken cancellationToken)
+    {
+        const string sql = """
+SELECT CASE WHEN COUNT(*) = 4 AND SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) = 4 THEN 1 ELSE 0 END
+FROM dbo.SyncProgress
+WHERE sync_name = @syncName
+  AND table_name IN ('dbo.staging_section2', 'dbo.staging_section_meta2', 'dbo.staging_section_centera2', 'dbo.staging_section_cdr_media2');
+""";
+
+        await using var connection = new SqlConnection(_options.DestinationConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = CreateCommand(sql, connection);
+        command.Parameters.AddWithValue("@syncName", syncName);
+
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return value is not null && value != DBNull.Value && Convert.ToInt32(value, CultureInfo.InvariantCulture) == 1;
     }
 
     private async Task ValidateBatchCompletionAsync(

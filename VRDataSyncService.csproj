@@ -19,4 +19,10 @@
   <ItemGroup>
     <Folder Include="SQL\" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="VRDataSyncStatusPublisher\**\*.cs" />
+    <EmbeddedResource Remove="VRDataSyncStatusPublisher\**\*" />
+    <None Remove="VRDataSyncStatusPublisher\**\*" />
+  </ItemGroup>
 </Project>
