@@ -230,6 +230,7 @@ CREATE TABLE dbo.SyncProgress
             fetchBoundaryAsync: (lastCcdrId, currentBatchSize, ct) => GetParentBoundaryAsync(source, lastCcdrId, currentBatchSize, ct),
             fetchRowsAsync: (lastCcdrId, maxCcdrId, ct) => ReadSection2RowsAsync(source, sourceTableName, commonColumns, lastCcdrId, maxCcdrId, ct),
             writeBatchAsync: (rows, tx, ct) => MergeBatchAsync(destination, tx, destinationTableName, commonColumns, [keyColumn], rows, ct),
+            allowEmptySourceBatchRanges: false,
             cancellationToken: cancellationToken);
     }
 
@@ -271,6 +272,7 @@ CREATE TABLE dbo.SyncProgress
             fetchBoundaryAsync: (lastCcdrId, currentBatchSize, ct) => GetParentBoundaryAsync(source, lastCcdrId, currentBatchSize, ct),
             fetchRowsAsync: (lastCcdrId, maxCcdrId, ct) => ReadTableRangeAsync(source, sourceTableName, commonColumns, "ccdr_id", lastCcdrId, maxCcdrId, ct),
             writeBatchAsync: (rows, tx, ct) => MergeBatchAsync(destination, tx, destinationTableName, commonColumns, mergeKeys, rows, ct),
+            allowEmptySourceBatchRanges: true,
             cancellationToken: cancellationToken);
     }
 
@@ -313,6 +315,7 @@ CREATE TABLE dbo.SyncProgress
                 requiredDestinationColumns,
                 rows,
                 ct),
+            allowEmptySourceBatchRanges: true,
             cancellationToken: cancellationToken);
     }
 
@@ -357,6 +360,7 @@ CREATE TABLE dbo.SyncProgress
             writeBatchAsync: (rows, tx, ct) => mergeKeys.Count > 0
                 ? MergeBatchAsync(destination, tx, destinationTableName, commonColumns, mergeKeys, rows, ct)
                 : InsertIfNotExistsAsync(destination, tx, destinationTableName, commonColumns, commonColumns, rows, ct),
+            allowEmptySourceBatchRanges: true,
             cancellationToken: cancellationToken);
     }
 
@@ -372,6 +376,7 @@ CREATE TABLE dbo.SyncProgress
         Func<string?, int, CancellationToken, Task<(bool hasRows, string? maxCcdrId)>> fetchBoundaryAsync,
         Func<string?, string?, CancellationToken, Task<DataTable>> fetchRowsAsync,
         Func<DataTable, SqlTransaction, CancellationToken, Task> writeBatchAsync,
+        bool allowEmptySourceBatchRanges,
         CancellationToken cancellationToken)
     {
         var lastCcdrId = await ExecuteWithRetryAsync(
@@ -543,9 +548,75 @@ CREATE TABLE dbo.SyncProgress
 
                 if (batchRowCount == 0)
                 {
+                    if (!allowEmptySourceBatchRanges)
+                    {
+                        rows.Dispose();
+                        throw new InvalidOperationException(
+                            $"Boundary lookup returned CCDR_ID {maxCcdrId} for {destinationTableName}, but the data read returned zero rows.");
+                    }
+
                     rows.Dispose();
-                    throw new InvalidOperationException(
-                        $"Boundary lookup returned CCDR_ID {maxCcdrId} for {destinationTableName}, but the data read returned zero rows.");
+
+                    await ExecuteWithRetryAsync(
+                        async token =>
+                        {
+                            await using var tx = await destination.BeginTransactionAsync(token);
+                            await UpsertProgressAsync(
+                                destination,
+                                (SqlTransaction)tx,
+                                syncName,
+                                destinationTableName,
+                                maxCcdrId,
+                                rowsIncrement: 0,
+                                sourceTotalRows: null,
+                                status: "running",
+                                completedAtUtc: null,
+                                lastError: null,
+                                token);
+                            await tx.CommitAsync(token);
+                        },
+                        $"Advance checkpoint for empty range on {destinationTableName}",
+                        cancellationToken);
+
+                    lastCcdrId = maxCcdrId;
+                    batchCycleStopwatch.Stop();
+
+                    _logger.LogInformation(
+                        "No rows found for batch #{BatchNumber} on {TableName} within boundary ending at {MaxCcdrId}. Checkpoint advanced with zero-row batch. End-to-end elapsed: {BatchElapsed}",
+                        batchNumber,
+                        destinationTableName,
+                        maxCcdrId,
+                        FormatDuration(batchCycleStopwatch.Elapsed));
+
+                    if (_performance.EnableAdaptiveBatchSizing)
+                    {
+                        var previousBatchSize = effectiveBatchSize;
+
+                        if (batchCycleStopwatch.Elapsed.TotalSeconds >= _performance.SlowBatchThresholdSeconds
+                            && effectiveBatchSize > _performance.MinBatchSize)
+                        {
+                            effectiveBatchSize = Math.Max(_performance.MinBatchSize, effectiveBatchSize / 2);
+                        }
+                        else if (batchCycleStopwatch.Elapsed.TotalSeconds <= _performance.FastBatchThresholdSeconds
+                                 && effectiveBatchSize < _performance.MaxBatchSize)
+                        {
+                            effectiveBatchSize = Math.Min(
+                                _performance.MaxBatchSize,
+                                effectiveBatchSize + Math.Max(1, effectiveBatchSize / 4));
+                        }
+
+                        if (effectiveBatchSize != previousBatchSize)
+                        {
+                            _logger.LogInformation(
+                                "Adaptive batch size adjusted for {TableName}: {PreviousBatchSize} -> {NewBatchSize} (end-to-end batch elapsed {BatchElapsed}).",
+                                destinationTableName,
+                                previousBatchSize,
+                                effectiveBatchSize,
+                                FormatDuration(batchCycleStopwatch.Elapsed));
+                        }
+                    }
+
+                    continue;
                 }
 
                 try
