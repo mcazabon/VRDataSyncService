@@ -449,18 +449,33 @@ CREATE TABLE dbo.SyncProgress
                 var isNearCompletionBatch = remainingRowsToProcess.HasValue && remainingRowsToProcess.Value <= currentBatchSize;
                 batchNumber++;
 
-                _logger.LogInformation(
-                    "Preparing batch #{BatchNumber} for {TableName}. Requested batch size: {CurrentBatchSize}. Remaining requested rows: {RemainingRows}. Current checkpoint: {LastCcdrId}",
-                    batchNumber,
-                    destinationTableName,
-                    currentBatchSize,
-                    remainingRowsToProcess,
-                    lastCcdrId ?? "<none>");
+                if (remainingRowsToProcess.HasValue)
+                {
+                    _logger.LogInformation(
+                        "Preparing batch #{BatchNumber} for {TableName}. Requested batch size: {CurrentBatchSize}. Remaining requested rows: {RemainingRows}. Current checkpoint: {LastCcdrId}",
+                        batchNumber,
+                        destinationTableName,
+                        currentBatchSize,
+                        remainingRowsToProcess.Value,
+                        lastCcdrId ?? "<none>");
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "Preparing batch #{BatchNumber} for {TableName}. Requested batch size: {CurrentBatchSize}. Current checkpoint: {LastCcdrId}",
+                        batchNumber,
+                        destinationTableName,
+                        currentBatchSize,
+                        lastCcdrId ?? "<none>");
+                }
 
+                var batchCycleStopwatch = Stopwatch.StartNew();
+                var boundaryStopwatch = Stopwatch.StartNew();
                 var (hasRows, maxCcdrId) = await ExecuteWithRetryAsync(
                     token => fetchBoundaryAsync(lastCcdrId, currentBatchSize, token),
                     $"Fetch boundary for {destinationTableName}",
                     cancellationToken);
+                boundaryStopwatch.Stop();
 
                 if (!hasRows || string.IsNullOrWhiteSpace(maxCcdrId))
                 {
@@ -483,10 +498,11 @@ CREATE TABLE dbo.SyncProgress
                 }
 
                 _logger.LogInformation(
-                    "Boundary resolved for batch #{BatchNumber} on {TableName}. Batch max CCDR_ID: {MaxCcdrId}",
+                    "Boundary resolved for batch #{BatchNumber} on {TableName}. Batch max CCDR_ID: {MaxCcdrId}. Boundary lookup elapsed: {BoundaryElapsed}",
                     batchNumber,
                     destinationTableName,
-                    maxCcdrId);
+                    maxCcdrId,
+                    FormatDuration(boundaryStopwatch.Elapsed));
 
                 if (!string.IsNullOrWhiteSpace(lastCcdrId)
                     && string.Compare(maxCcdrId, lastCcdrId, StringComparison.OrdinalIgnoreCase) <= 0)
@@ -495,131 +511,164 @@ CREATE TABLE dbo.SyncProgress
                         $"Invalid boundary for {destinationTableName}: max CCDR_ID {maxCcdrId} is not greater than last CCDR_ID {lastCcdrId}.");
                 }
 
-                var batchStopwatch = Stopwatch.StartNew();
-                var rows = await ExecuteWithRetryAsync(
+                var readStopwatch = Stopwatch.StartNew();
+                var fetchedRows = await ExecuteWithRetryAsync(
                     token => fetchRowsAsync(lastCcdrId, maxCcdrId, token),
                     $"Read rows for {destinationTableName}",
                     cancellationToken);
+                readStopwatch.Stop();
+
+                DataTable rows = fetchedRows;
+                if (remainingRowsToProcess.HasValue && fetchedRows.Rows.Count > remainingRowsToProcess.Value)
+                {
+                    var trimmedRows = TakeTopRows(fetchedRows, (int)remainingRowsToProcess.Value);
+                    if (!ReferenceEquals(trimmedRows, fetchedRows))
+                    {
+                        rows = trimmedRows;
+                        fetchedRows.Dispose();
+                    }
+                }
+
+                var batchRowCount = rows.Rows.Count;
 
                 _logger.LogInformation(
-                    "Read completed for batch #{BatchNumber} on {TableName}. Rows fetched: {RowsFetched}",
+                    "Read completed for batch #{BatchNumber} on {TableName}. Rows fetched: {RowsFetched}. Read elapsed: {ReadElapsed}",
                     batchNumber,
                     destinationTableName,
-                    rows.Rows.Count);
+                    batchRowCount,
+                    FormatDuration(readStopwatch.Elapsed));
 
-                if (rows.Rows.Count == 0)
+                if (batchRowCount == 0)
                 {
+                    rows.Dispose();
                     throw new InvalidOperationException(
                         $"Boundary lookup returned CCDR_ID {maxCcdrId} for {destinationTableName}, but the data read returned zero rows.");
                 }
 
-                if (remainingRowsToProcess.HasValue && rows.Rows.Count > remainingRowsToProcess.Value)
+                try
                 {
-                    rows = TakeTopRows(rows, (int)remainingRowsToProcess.Value);
+                    var checkpointCcdrId = GetMaxCcdrIdFromRows(rows, checkpointColumn) ?? maxCcdrId;
+
+                    _logger.LogInformation(
+                        "Writing batch #{BatchNumber} for {TableName}. Checkpoint CCDR_ID to persist: {CheckpointCcdrId}",
+                        batchNumber,
+                        destinationTableName,
+                        checkpointCcdrId);
+
+                    var writeStopwatch = Stopwatch.StartNew();
+                    await ExecuteWithRetryAsync(
+                        async token =>
+                        {
+                            await using var tx = await destination.BeginTransactionAsync(token);
+                            await writeBatchAsync(rows, (SqlTransaction)tx, token);
+                            await UpsertProgressAsync(
+                                destination,
+                                (SqlTransaction)tx,
+                                syncName,
+                                destinationTableName,
+                                checkpointCcdrId,
+                                batchRowCount,
+                                sourceTotalRows: null,
+                                status: "running",
+                                completedAtUtc: null,
+                                lastError: null,
+                                token);
+                            await tx.CommitAsync(token);
+                        },
+                        $"Write batch for {destinationTableName}",
+                        cancellationToken);
+                    writeStopwatch.Stop();
+
+                    lastCcdrId = checkpointCcdrId;
+                    rowsProcessedThisRun += batchRowCount;
+                    if (remainingRowsToProcess.HasValue)
+                    {
+                        remainingRowsToProcess -= batchRowCount;
+                    }
+
+                    var totalProcessed = existingRowsProcessed + rowsProcessedThisRun;
+
+                    var validationStopwatch = Stopwatch.StartNew();
+                    await ValidateBatchCompletionAsync(
+                        destination,
+                        syncName,
+                        destinationTableName,
+                        checkpointCcdrId,
+                        totalProcessed,
+                        remainingRowsToProcess,
+                        cancellationToken);
+                    validationStopwatch.Stop();
+
+                    _logger.LogInformation(
+                        "Batch #{BatchNumber} validation succeeded for {TableName}. Persisted checkpoint: {CheckpointCcdrId}. Persisted rows processed target: {TotalProcessed}. Validation elapsed: {ValidationElapsed}",
+                        batchNumber,
+                        destinationTableName,
+                        checkpointCcdrId,
+                        totalProcessed,
+                        FormatDuration(validationStopwatch.Elapsed));
+
+                    batchCycleStopwatch.Stop();
+
+                    var remainingRows = Math.Max(0L, sourceTotalRows - totalProcessed);
+                    var elapsedSeconds = Math.Max(runStopwatch.Elapsed.TotalSeconds, 0.001D);
+                    var averageRowsPerSecond = rowsProcessedThisRun / elapsedSeconds;
+                    var dataPhaseRowsPerSecond = batchRowCount / Math.Max(readStopwatch.Elapsed.TotalSeconds + writeStopwatch.Elapsed.TotalSeconds, 0.001D);
+                    var endToEndBatchRowsPerSecond = batchRowCount / Math.Max(batchCycleStopwatch.Elapsed.TotalSeconds, 0.001D);
+                    TimeSpan? eta = averageRowsPerSecond > 0
+                        ? TimeSpan.FromSeconds(remainingRows / averageRowsPerSecond)
+                        : null;
+
+                    var managedMemoryMb = GC.GetTotalMemory(false) / (1024D * 1024D);
+
+                    _logger.LogInformation(
+                        "Batch synced for {TableName}. Last CCDR_ID: {LastCcdrId}. Batch rows: {BatchRows}. Total processed: {TotalProcessed}/{SourceTotalRows}. Data-phase rate: {DataPhaseRowsPerSecond:F2} rows/sec. End-to-end batch rate: {EndToEndBatchRowsPerSecond:F2} rows/sec. Avg rate: {AverageRowsPerSecond:F2} rows/sec. Timings [boundary/read/write/validate/total]: {BoundaryElapsed}/{ReadElapsed}/{WriteElapsed}/{ValidationElapsed}/{TotalElapsed}. Managed memory: {ManagedMemoryMb:F2} MB. ETA: {Eta}",
+                        destinationTableName,
+                        lastCcdrId,
+                        batchRowCount,
+                        totalProcessed,
+                        sourceTotalRows,
+                        dataPhaseRowsPerSecond,
+                        endToEndBatchRowsPerSecond,
+                        averageRowsPerSecond,
+                        FormatDuration(boundaryStopwatch.Elapsed),
+                        FormatDuration(readStopwatch.Elapsed),
+                        FormatDuration(writeStopwatch.Elapsed),
+                        FormatDuration(validationStopwatch.Elapsed),
+                        FormatDuration(batchCycleStopwatch.Elapsed),
+                        managedMemoryMb,
+                        eta.HasValue ? FormatDuration(eta.Value) : "N/A");
+
+                    if (_performance.EnableAdaptiveBatchSizing)
+                    {
+                        var previousBatchSize = effectiveBatchSize;
+
+                        if (batchCycleStopwatch.Elapsed.TotalSeconds >= _performance.SlowBatchThresholdSeconds
+                            && effectiveBatchSize > _performance.MinBatchSize)
+                        {
+                            effectiveBatchSize = Math.Max(_performance.MinBatchSize, effectiveBatchSize / 2);
+                        }
+                        else if (batchCycleStopwatch.Elapsed.TotalSeconds <= _performance.FastBatchThresholdSeconds
+                                 && effectiveBatchSize < _performance.MaxBatchSize)
+                        {
+                            effectiveBatchSize = Math.Min(
+                                _performance.MaxBatchSize,
+                                effectiveBatchSize + Math.Max(1, effectiveBatchSize / 4));
+                        }
+
+                        if (effectiveBatchSize != previousBatchSize)
+                        {
+                            _logger.LogInformation(
+                                "Adaptive batch size adjusted for {TableName}: {PreviousBatchSize} -> {NewBatchSize} (end-to-end batch elapsed {BatchElapsed}).",
+                                destinationTableName,
+                                previousBatchSize,
+                                effectiveBatchSize,
+                                FormatDuration(batchCycleStopwatch.Elapsed));
+                        }
+                    }
                 }
-
-                var checkpointCcdrId = GetMaxCcdrIdFromRows(rows, checkpointColumn) ?? maxCcdrId;
-
-                _logger.LogInformation(
-                    "Writing batch #{BatchNumber} for {TableName}. Checkpoint CCDR_ID to persist: {CheckpointCcdrId}",
-                    batchNumber,
-                    destinationTableName,
-                    checkpointCcdrId);
-
-                await ExecuteWithRetryAsync(
-                    async token =>
-                    {
-                        await using var tx = await destination.BeginTransactionAsync(token);
-                        await writeBatchAsync(rows, (SqlTransaction)tx, token);
-                        await UpsertProgressAsync(
-                            destination,
-                            (SqlTransaction)tx,
-                            syncName,
-                            destinationTableName,
-                            checkpointCcdrId,
-                            rows.Rows.Count,
-                            sourceTotalRows: null,
-                            status: "running",
-                            completedAtUtc: null,
-                            lastError: null,
-                            token);
-                        await tx.CommitAsync(token);
-                    },
-                    $"Write batch for {destinationTableName}",
-                    cancellationToken);
-
-                batchStopwatch.Stop();
-
-                lastCcdrId = checkpointCcdrId;
-                rowsProcessedThisRun += rows.Rows.Count;
-                if (remainingRowsToProcess.HasValue)
+                finally
                 {
-                    remainingRowsToProcess -= rows.Rows.Count;
-                }
-
-                var totalProcessed = existingRowsProcessed + rowsProcessedThisRun;
-
-                await ValidateBatchCompletionAsync(
-                    destination,
-                    syncName,
-                    destinationTableName,
-                    checkpointCcdrId,
-                    totalProcessed,
-                    remainingRowsToProcess,
-                    cancellationToken);
-
-                _logger.LogInformation(
-                    "Batch #{BatchNumber} validation succeeded for {TableName}. Persisted checkpoint: {CheckpointCcdrId}. Persisted rows processed target: {TotalProcessed}",
-                    batchNumber,
-                    destinationTableName,
-                    checkpointCcdrId,
-                    totalProcessed);
-
-                var remainingRows = Math.Max(0L, sourceTotalRows - totalProcessed);
-                var elapsedSeconds = Math.Max(runStopwatch.Elapsed.TotalSeconds, 0.001D);
-                var averageRowsPerSecond = rowsProcessedThisRun / elapsedSeconds;
-                var batchRowsPerSecond = rows.Rows.Count / Math.Max(batchStopwatch.Elapsed.TotalSeconds, 0.001D);
-                TimeSpan? eta = averageRowsPerSecond > 0
-                    ? TimeSpan.FromSeconds(remainingRows / averageRowsPerSecond)
-                    : null;
-
-                _logger.LogInformation(
-                    "Batch synced for {TableName}. Last CCDR_ID: {LastCcdrId}. Batch rows: {BatchRows}. Total processed: {TotalProcessed}/{SourceTotalRows}. Batch rate: {BatchRowsPerSecond:F2} rows/sec. Avg rate: {AverageRowsPerSecond:F2} rows/sec. ETA: {Eta}",
-                    destinationTableName,
-                    lastCcdrId,
-                    rows.Rows.Count,
-                    totalProcessed,
-                    sourceTotalRows,
-                    batchRowsPerSecond,
-                    averageRowsPerSecond,
-                    eta.HasValue ? FormatDuration(eta.Value) : "N/A");
-
-                if (_performance.EnableAdaptiveBatchSizing)
-                {
-                    var previousBatchSize = effectiveBatchSize;
-
-                    if (batchStopwatch.Elapsed.TotalSeconds >= _performance.SlowBatchThresholdSeconds
-                        && effectiveBatchSize > _performance.MinBatchSize)
-                    {
-                        effectiveBatchSize = Math.Max(_performance.MinBatchSize, effectiveBatchSize / 2);
-                    }
-                    else if (batchStopwatch.Elapsed.TotalSeconds <= _performance.FastBatchThresholdSeconds
-                             && effectiveBatchSize < _performance.MaxBatchSize)
-                    {
-                        effectiveBatchSize = Math.Min(
-                            _performance.MaxBatchSize,
-                            effectiveBatchSize + Math.Max(1, effectiveBatchSize / 4));
-                    }
-
-                    if (effectiveBatchSize != previousBatchSize)
-                    {
-                        _logger.LogInformation(
-                            "Adaptive batch size adjusted for {TableName}: {PreviousBatchSize} -> {NewBatchSize} (batch elapsed {BatchElapsed}).",
-                            destinationTableName,
-                            previousBatchSize,
-                            effectiveBatchSize,
-                            FormatDuration(batchStopwatch.Elapsed));
-                    }
+                    rows.Dispose();
                 }
             }
 
