@@ -1611,7 +1611,7 @@ SELECT CASE WHEN EXISTS
         => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
 
     private static string FormatDuration(TimeSpan duration)
-        => $"{(int)duration.TotalDays}d {duration.Hours:D2}h {duration.Minutes:D2}m";
+        => $"{(int)duration.TotalDays}d {duration.Hours:D2}h {duration.Minutes:D2}m {duration.Seconds:D2}s";
 
     private static void ValidateOptions(SyncOptions options)
     {
