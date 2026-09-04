@@ -1013,9 +1013,10 @@ SELECT
     c.ts_insert1,
     s.Start_Time AS section_start_time
 FROM {sourceTableName} AS c
-LEFT JOIN dbo.section2 AS s
+INNER JOIN dbo.section2 AS s
     ON s.CCDR_ID = c.ccdr_id
 WHERE c.ccdr_id <= @maxCcdrId
+  AND s.Start_Time IS NOT NULL
 ORDER BY c.ccdr_id;
 """
             : $"""
@@ -1027,10 +1028,11 @@ SELECT
     c.ts_insert1,
     s.Start_Time AS section_start_time
 FROM {sourceTableName} AS c
-LEFT JOIN dbo.section2 AS s
+INNER JOIN dbo.section2 AS s
     ON s.CCDR_ID = c.ccdr_id
 WHERE c.ccdr_id > @lastCcdrId
   AND c.ccdr_id <= @maxCcdrId
+  AND s.Start_Time IS NOT NULL
 ORDER BY c.ccdr_id;
 """;
 
@@ -1062,18 +1064,20 @@ ORDER BY c.ccdr_id;
             ? $"""
 SELECT {string.Join(", ", projection)}
 FROM {sourceTableName} AS m
-LEFT JOIN dbo.section2 AS s
+INNER JOIN dbo.section2 AS s
     ON s.CCDR_ID = m.ccdr_id
 WHERE m.ccdr_id <= @maxCcdrId
+  AND s.Start_Time IS NOT NULL
 ORDER BY m.ccdr_id;
 """
             : $"""
 SELECT {string.Join(", ", projection)}
 FROM {sourceTableName} AS m
-LEFT JOIN dbo.section2 AS s
+INNER JOIN dbo.section2 AS s
     ON s.CCDR_ID = m.ccdr_id
 WHERE m.ccdr_id > @lastCcdrId
   AND m.ccdr_id <= @maxCcdrId
+  AND s.Start_Time IS NOT NULL
 ORDER BY m.ccdr_id;
 """;
 
