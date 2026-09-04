@@ -132,6 +132,11 @@ CREATE TABLE dbo.SyncProgress
             await using var destinationConnection = new SqlConnection(_options.DestinationConnectionString);
 
             await ExecuteWithRetryAsync(
+                token => EnsureSourceDatabaseExistsAsync(token),
+                "Ensure source database exists",
+                stoppingToken);
+
+            await ExecuteWithRetryAsync(
                 token => sourceConnection.OpenAsync(token),
                 "Open source connection",
                 stoppingToken);
@@ -140,6 +145,11 @@ CREATE TABLE dbo.SyncProgress
             await ExecuteWithRetryAsync(
                 token => LogSourceIndexDiagnosticsAsync(sourceConnection, token),
                 "Check source index coverage",
+                stoppingToken);
+
+            await ExecuteWithRetryAsync(
+                token => EnsureDestinationDatabaseExistsAsync(token),
+                "Ensure destination database exists",
                 stoppingToken);
 
             await ExecuteWithRetryAsync(
@@ -655,6 +665,81 @@ CREATE TABLE dbo.SyncProgress
 
             _logger.LogError(ex, "Failed syncing {TableName}.", destinationTableName);
             throw;
+        }
+    }
+
+    private async Task EnsureSourceDatabaseExistsAsync(CancellationToken cancellationToken)
+    {
+        var sourceBuilder = new SqlConnectionStringBuilder(_options.SourceConnectionString);
+        var sourceDatabaseName = sourceBuilder.InitialCatalog;
+
+        if (string.IsNullOrWhiteSpace(sourceDatabaseName))
+        {
+            throw new InvalidOperationException("Source connection string must include a database name.");
+        }
+
+        var sourceServerConnectionBuilder = new SqlConnectionStringBuilder(_options.SourceConnectionString)
+        {
+            InitialCatalog = "master"
+        };
+
+        await using var sourceServerConnection = new SqlConnection(sourceServerConnectionBuilder.ConnectionString);
+        await sourceServerConnection.OpenAsync(cancellationToken);
+
+        const string sql = "SELECT DB_ID(@databaseName);";
+        await using var command = CreateCommand(sql, sourceServerConnection);
+        command.Parameters.AddWithValue("@databaseName", sourceDatabaseName);
+
+        var databaseId = await command.ExecuteScalarAsync(cancellationToken);
+        if (databaseId is null || databaseId == DBNull.Value)
+        {
+            throw new InvalidOperationException($"Source database {sourceDatabaseName} does not exist or is not accessible.");
+        }
+
+        _logger.LogInformation("Source database {DatabaseName} is available.", sourceDatabaseName);
+    }
+
+    private async Task EnsureDestinationDatabaseExistsAsync(CancellationToken cancellationToken)
+    {
+        var destinationBuilder = new SqlConnectionStringBuilder(_options.DestinationConnectionString);
+        var destinationDatabaseName = destinationBuilder.InitialCatalog;
+
+        if (string.IsNullOrWhiteSpace(destinationDatabaseName))
+        {
+            throw new InvalidOperationException("Destination connection string must include a database name.");
+        }
+
+        var serverConnectionBuilder = new SqlConnectionStringBuilder(_options.DestinationConnectionString)
+        {
+            InitialCatalog = "master"
+        };
+
+        await using var serverConnection = new SqlConnection(serverConnectionBuilder.ConnectionString);
+        await serverConnection.OpenAsync(cancellationToken);
+
+        const string sql = """
+DECLARE @created bit = 0;
+IF DB_ID(@databaseName) IS NULL
+BEGIN
+    DECLARE @createSql nvarchar(max) = N'CREATE DATABASE ' + QUOTENAME(@databaseName) + N';';
+    EXEC (@createSql);
+    SET @created = 1;
+END
+
+SELECT @created;
+""";
+
+        await using var command = CreateCommand(sql, serverConnection);
+        command.Parameters.AddWithValue("@databaseName", destinationDatabaseName);
+
+        var created = await command.ExecuteScalarAsync(cancellationToken);
+        if (created is not null && created != DBNull.Value && Convert.ToBoolean(created))
+        {
+            _logger.LogInformation("Created destination database {DatabaseName}.", destinationDatabaseName);
+        }
+        else
+        {
+            _logger.LogInformation("Destination database {DatabaseName} already exists.", destinationDatabaseName);
         }
     }
 
